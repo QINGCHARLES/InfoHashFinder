@@ -29,6 +29,12 @@ public sealed class Repository(string? ConnectionString = null)
 
 	private readonly string ConnectionStringValue = ConnectionString ?? DefaultConnection;
 
+	static Repository()
+	{
+		// Register custom DateTimeOffset handler exactly once.
+		SqlMapper.AddTypeHandler(new DateTimeOffsetHandler());
+	}
+
 	public async Task EnsureSchemaAsync()
 	{
 		await using SqliteConnection Connection = new(ConnectionStringValue);
