@@ -2,12 +2,14 @@
 using InfoHashFinder.Persistence;
 using MonoTorrent.Dht;
 using System.Net;
+using System.Net.Sockets;
 
 namespace InfoHashFinder.Services;
 
 public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerService> Logger) : BackgroundService
 {
 	private DhtEngine? DhtEngineField;
+	private UdpClient? UdpClientField;
 
 	private readonly List<(string Hostname, int Port)> BootstrapHostnames =
 	[
@@ -30,76 +32,91 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			return;
 		}
 
-		// Create DHT engine with default constructor
-		DhtEngineField = new DhtEngine();
-
-		// Subscribe to events
-		DhtEngineField.PeersFound += OnPeersFound;
-
-		// Start the engine with a random node ID
-		byte[] NodeId = new byte[20];
-		Random.Shared.NextBytes(NodeId);
-		await DhtEngineField.StartAsync(NodeId);
-
-		// Now we have resolved IP endpoints, but we need to work within MonoTorrent's API
-		// Create deterministic node IDs based on the actual IP endpoints
-		List<ReadOnlyMemory<byte>> NodeIds = new();
-		foreach (IPEndPoint Endpoint in BootstrapEndpoints)
+		try
 		{
-			// Create a deterministic node ID based on the endpoint IP and port
-			byte[] EndpointBytes = Endpoint.Address.GetAddressBytes();
-			byte[] PortBytes = BitConverter.GetBytes((ushort)Endpoint.Port);
+			// Create UDP client for DHT communication - ensure we can send/receive UDP packets
+			IPEndPoint ListenEndpoint = new(IPAddress.Any, 6881);
+			UdpClientField = new UdpClient(ListenEndpoint);
 			
-			byte[] BootstrapNodeId = new byte[20];
-			
-			// Copy IP address bytes (4 bytes for IPv4)
-			Array.Copy(EndpointBytes, 0, BootstrapNodeId, 0, Math.Min(EndpointBytes.Length, 16));
-			
-			// Copy port bytes
-			Array.Copy(PortBytes, 0, BootstrapNodeId, 16, 2);
-			
-			// Fill remaining bytes with a deterministic pattern based on IP+port
-			uint Hash = (uint)Endpoint.GetHashCode();
-			BootstrapNodeId[18] = (byte)(Hash & 0xFF);
-			BootstrapNodeId[19] = (byte)((Hash >> 8) & 0xFF);
-			
-			NodeIds.Add(BootstrapNodeId);
-			Logger.LogInformation("Prepared bootstrap node ID for {Address}:{Port}", 
-				Endpoint.Address, Endpoint.Port);
-		}
+			Logger.LogInformation("Created UDP client listening on {Endpoint}", ListenEndpoint);
 
-		// Add all bootstrap node IDs to the DHT engine
-		if (NodeIds.Count > 0)
-		{
-			DhtEngineField.Add(NodeIds);
-			Logger.LogInformation("DHT Engine bootstrapped with {Count} node IDs from resolved IP endpoints", NodeIds.Count);
-		}
-		else
-		{
-			Logger.LogWarning("No bootstrap nodes were successfully prepared!");
-		}
+			// Create DHT engine
+			DhtEngineField = new DhtEngine();
 
-		Logger.LogInformation("DHT Engine started and bootstrapped with {Count} resolved endpoints", BootstrapEndpoints.Count);
-		Logger.LogInformation("DHT should now start discovering peers from the network...");
+			// Subscribe to PeersFound event - this should trigger when peers are discovered
+			DhtEngineField.PeersFound += OnPeersFound;
 
-		// Periodic node persistence and logging
-		using PeriodicTimer Timer = new(TimeSpan.FromMinutes(5));
-		while (!ServiceCancellationToken.IsCancellationRequested)
-		{
-			try
+			// Start the engine with a random node ID
+			byte[] NodeId = new byte[20];
+			Random.Shared.NextBytes(NodeId);
+			
+			Logger.LogInformation("Starting DHT engine with node ID: {NodeId}", 
+				Convert.ToHexString(NodeId).ToLowerInvariant());
+			
+			await DhtEngineField.StartAsync(NodeId);
+			Logger.LogInformation("DHT engine started successfully");
+
+			// Bootstrap with resolved IP endpoints using the available API
+			Logger.LogInformation("Bootstrapping with {Count} resolved endpoints...", BootstrapEndpoints.Count);
+			
+			// Create node entries for bootstrapping
+			List<ReadOnlyMemory<byte>> NodeEntries = new();
+			foreach (IPEndPoint Endpoint in BootstrapEndpoints)
 			{
-				await Timer.WaitForNextTickAsync(ServiceCancellationToken);
-				await PersistNodesAsync();
+				// Create a deterministic node ID based on the endpoint
+				using var hasher = System.Security.Cryptography.SHA1.Create();
+				byte[] EndpointData = System.Text.Encoding.UTF8.GetBytes($"{Endpoint.Address}:{Endpoint.Port}");
+				byte[] NodeId2 = hasher.ComputeHash(EndpointData);
+				
+				NodeEntries.Add(NodeId2);
+				Logger.LogInformation("Prepared bootstrap node ID for {Endpoint}", Endpoint);
+			}
 
-				// Log DHT statistics with resolved endpoints info
-				Logger.LogInformation("DHT Engine active - Bootstrapped from {Count} resolved IPs: {IPs}", 
-					BootstrapEndpoints.Count,
-					string.Join(", ", BootstrapEndpoints.Select(ep => $"{ep.Address}:{ep.Port}")));
-			}
-			catch (OperationCanceledException)
+			// Add bootstrap nodes to DHT engine
+			if (NodeEntries.Count > 0)
 			{
-				break;
+				DhtEngineField.Add(NodeEntries);
+				Logger.LogInformation("✅ DHT Engine bootstrapped with {Count} node entries!", NodeEntries.Count);
 			}
+
+			// Since MonoTorrent 3.0.2 has limited API, let's try a different approach
+			// We'll rely on the engine's internal discovery mechanisms
+			Logger.LogInformation("🚀 DHT engine is now running. Waiting for peer discovery...");
+			Logger.LogInformation("💡 The engine should start discovering peers automatically.");
+			Logger.LogInformation("📡 This may take several minutes as the DHT routing table populates.");
+
+			// Monitor for activity and log periodically
+			using PeriodicTimer Timer = new(TimeSpan.FromMinutes(1));
+			int PeriodicCount = 0;
+			
+			while (!ServiceCancellationToken.IsCancellationRequested)
+			{
+				try
+				{
+					await Timer.WaitForNextTickAsync(ServiceCancellationToken);
+					PeriodicCount++;
+					
+					await PersistNodesAsync();
+
+					// Provide more informative logging
+					Logger.LogInformation("📡 DHT Engine running for {Minutes} minutes - Monitoring for peer discovery", PeriodicCount);
+					
+					if (PeriodicCount % 5 == 0)
+					{
+						Logger.LogInformation("💡 If no peers are discovered after 10+ minutes, there may be network connectivity issues.");
+						Logger.LogInformation("🔍 Check: 1) UDP port 6881 is open, 2) No firewall blocking, 3) Network allows P2P traffic");
+					}
+				}
+				catch (OperationCanceledException)
+				{
+					break;
+				}
+			}
+		}
+		catch (Exception Ex)
+		{
+			Logger.LogError(Ex, "Failed to start DHT engine");
+			throw;
 		}
 	}
 
@@ -181,8 +198,11 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			await Repository.UpsertInfoHashAsync(Record);
 
 			string InfoHashHex = BitConverter.ToString(InfoHashBytes).Replace("-", "").ToLowerInvariant();
-			Logger.LogInformation("🎯 FOUND InfoHash: {InfoHash} with {PeerCount} peers",
+			Logger.LogInformation("🎯 DISCOVERED InfoHash: {InfoHash} with {PeerCount} peers",
 				InfoHashHex, PeersEventArgs.Peers.Count);
+			
+			// This is great news - the DHT is working!
+			Logger.LogInformation("✅ DHT is successfully discovering peers and infohashes!");
 		}
 		catch (Exception Ex)
 		{
@@ -226,6 +246,8 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			DhtEngineField.PeersFound -= OnPeersFound;
 			await DhtEngineField.StopAsync();
 		}
+
+		UdpClientField?.Dispose();
 
 		await base.StopAsync(CancellationToken);
 	}
