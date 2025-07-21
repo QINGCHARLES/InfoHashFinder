@@ -14,6 +14,8 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	private int TotalPacketsReceived = 0;
 	private int TotalPacketsSent = 0;
 	private readonly List<IPEndPoint> DiscoveredNodes = new();
+	private int InfoHashesFound = 0;
+	private int NodesExtracted = 0;
 
 	private readonly List<(string Hostname, int Port)> BootstrapHostnames = new()
 	{
@@ -86,7 +88,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			// Start manual DHT crawling process
 			_ = Task.Run(async () => await PerformManualDhtCrawlingAsync(BootstrapEndpoints, ServiceCancellationToken));
 
-			Logger.LogInformation("🚀 DHT engine running with enhanced InfoHash extraction...");
+			Logger.LogInformation("🚀 DHT engine running with FIXED InfoHash extraction...");
 
 			// Monitor for activity and log statistics
 			using PeriodicTimer Timer = new(TimeSpan.FromMinutes(1));
@@ -122,8 +124,8 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			int InfoHashCount = await Repository.GetInfoHashCountAsync();
 			int NodeCount = await Repository.GetNodeCountAsync();
 
-			Logger.LogInformation("📊 DHT Stats - Running: {Minutes}min | InfoHashes: {InfoHashCount} | Nodes: {NodeCount} | Discovered: {DiscoveredCount} | Sent: {Sent} | Received: {Received}", 
-				Minutes, InfoHashCount, NodeCount, DiscoveredNodes.Count, TotalPacketsSent, TotalPacketsReceived);
+			Logger.LogInformation("📊 DHT Stats - Running: {Minutes}min | InfoHashes: {InfoHashCount}/{Found} | Nodes: {NodeCount}/{Extracted} | Discovered: {DiscoveredCount} | Sent: {Sent} | Received: {Received}", 
+				Minutes, InfoHashCount, InfoHashesFound, NodeCount, NodesExtracted, DiscoveredNodes.Count, TotalPacketsSent, TotalPacketsReceived);
 
 			// Log recent discoveries every 5 minutes
 			if (Minutes % 5 == 0 && InfoHashCount > 0)
@@ -133,11 +135,24 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					string.Join(", ", RecentHashes.Select(h => Convert.ToHexString(h.InfoHash).ToLowerInvariant()[..8] + "...")));
 			}
 
-			// Force database commit every 10 minutes
-			if (Minutes % 10 == 0)
+			// Force database commit every 5 minutes to be more aggressive
+			if (Minutes % 5 == 0)
 			{
 				await Repository.ForceCommitAsync();
-				Logger.LogInformation("💾 Forced database commit to ensure data persistence");
+				Logger.LogInformation("💾 Forced database commit - InfoHashes: {InfoHashCount}, Nodes: {NodeCount}", InfoHashCount, NodeCount);
+			}
+
+			// Log diagnostic warnings
+			if (Minutes % 10 == 0)
+			{
+				if (DiscoveredNodes.Count < 10)
+				{
+					Logger.LogWarning("⚠️ Only {Count} nodes discovered in {Minutes} minutes - node extraction may be failing", DiscoveredNodes.Count, Minutes);
+				}
+				if (InfoHashesFound == 0)
+				{
+					Logger.LogWarning("⚠️ No InfoHashes found in {Minutes} minutes - may need to wait longer or check different nodes", Minutes);
+				}
 			}
 		}
 		catch (Exception Ex)
@@ -181,7 +196,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 		{
 			await Task.Delay(TimeSpan.FromSeconds(10), CancellationToken);
 
-			Logger.LogInformation("🔄 Starting enhanced DHT crawling with InfoHash extraction...");
+			Logger.LogInformation("🔄 Starting FIXED DHT crawling with proper bencode parsing...");
 
 			// Start listening for incoming UDP packets
 			_ = Task.Run(async () => await ListenForIncomingDhtMessagesAsync(CancellationToken));
@@ -193,7 +208,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			using PeriodicTimer CrawlTimer = new(TimeSpan.FromMinutes(1));
 			int CrawlCount = 0;
 
-			while (!CancellationToken.IsCancellationRequested && CrawlCount < 60)
+			while (!CancellationToken.IsCancellationRequested && CrawlCount < 600) // Run much longer
 			{
 				try
 				{
@@ -225,12 +240,12 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 		// Wait for initial bootstrap
 		await Task.Delay(TimeSpan.FromSeconds(30), CancellationToken);
 
-		Logger.LogInformation("🔍 Starting aggressive node discovery to find active DHT participants...");
+		Logger.LogInformation("🔍 Starting FIXED aggressive node discovery...");
 
-		using PeriodicTimer DiscoveryTimer = new(TimeSpan.FromSeconds(30));
+		using PeriodicTimer DiscoveryTimer = new(TimeSpan.FromSeconds(15)); // More frequent
 		int DiscoveryRound = 0;
 
-		while (!CancellationToken.IsCancellationRequested && DiscoveryRound < 120)
+		while (!CancellationToken.IsCancellationRequested && DiscoveryRound < 2400) // Run much longer
 		{
 			try
 			{
@@ -238,16 +253,20 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 				DiscoveryRound++;
 
 				// Send find_node queries with well-distributed target IDs
-				foreach (IPEndPoint Endpoint in BootstrapEndpoints.Concat(DiscoveredNodes.Take(10)))
+				foreach (IPEndPoint Endpoint in BootstrapEndpoints.Concat(DiscoveredNodes.Take(50)))
 				{
-					for (int i = 0; i < 5; i++)
+					for (int i = 0; i < 10; i++) // More queries per node
 					{
 						await SendAggressiveFindNodeAsync(Endpoint);
-						await Task.Delay(100, CancellationToken);
+						await Task.Delay(50, CancellationToken); // Faster
 					}
 				}
 
-				Logger.LogDebug("🔍 Aggressive discovery round {Round} completed", DiscoveryRound);
+				if (DiscoveryRound % 20 == 0)
+				{
+					Logger.LogInformation("🔍 Aggressive discovery round {Round} completed - discovered {Count} nodes", 
+						DiscoveryRound, DiscoveredNodes.Count);
+				}
 			}
 			catch (OperationCanceledException)
 			{
@@ -289,18 +308,18 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	{
 		if (DiscoveredNodes.Count == 0) return;
 
-		// Query some of the discovered nodes for InfoHashes
-		var NodesToQuery = DiscoveredNodes.Take(20).ToList();
+		// Query more of the discovered nodes for InfoHashes
+		var NodesToQuery = DiscoveredNodes.Take(50).ToList(); // Query more nodes
 		
 		foreach (IPEndPoint Node in NodesToQuery)
 		{
 			try
 			{
 				// Send get_peers queries for random InfoHashes
-				for (int i = 0; i < 3; i++)
+				for (int i = 0; i < 5; i++) // More queries per node
 				{
 					await SendGetPeersQueryAsync(Node);
-					await Task.Delay(100);
+					await Task.Delay(50); // Faster
 				}
 			}
 			catch (Exception Ex)
@@ -316,7 +335,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	{
 		if (UdpClientField is null) return;
 
-		Logger.LogInformation("📡 Sending DHT queries - Round {Round}", Round);
+		Logger.LogDebug("📡 Sending DHT queries - Round {Round}", Round);
 
 		foreach (IPEndPoint Endpoint in BootstrapEndpoints)
 		{
@@ -324,15 +343,15 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			{
 				// Send ping first
 				await SendDhtPingAsync(Endpoint);
-				await Task.Delay(200);
+				await Task.Delay(100);
 
 				// Send find_node query to discover more nodes
 				await SendFindNodeQueryAsync(Endpoint);
-				await Task.Delay(200);
+				await Task.Delay(100);
 
 				// Send get_peers query for random infohashes to trigger responses
 				await SendGetPeersQueryAsync(Endpoint);
-				await Task.Delay(200);
+				await Task.Delay(100);
 			}
 			catch (Exception Ex)
 			{
@@ -408,7 +427,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	{
 		if (UdpClientField is null) return;
 
-		Logger.LogInformation("👂 Started listening for incoming DHT messages...");
+		Logger.LogInformation("👂 Started listening for incoming DHT messages with FIXED parsing...");
 
 		try
 		{
@@ -422,7 +441,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					Logger.LogDebug("📥 Received UDP packet #{PacketNum} from {RemoteEndpoint}: {Length} bytes", 
 						TotalPacketsReceived, Result.RemoteEndPoint, Result.Buffer.Length);
 
-					// Process the DHT message
+					// Process the DHT message with FIXED parsing
 					await ProcessIncomingDhtMessageAsync(Result.Buffer, Result.RemoteEndPoint);
 				}
 				catch (OperationCanceledException)
@@ -445,18 +464,15 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	{
 		try
 		{
+			// Extract and store nodes using FIXED binary parsing
+			await ExtractCompactNodesFromBinaryData(MessageData, RemoteEndpoint);
+
+			// Extract InfoHashes using FIXED binary parsing  
+			await ExtractInfoHashesFromBinaryData(MessageData, RemoteEndpoint);
+
+			// Also try string-based parsing as fallback
 			string Message = Encoding.Latin1.GetString(MessageData);
-			
-			// Parse compact node info to discover new nodes
-			await ExtractAndStoreNodesFromMessage(Message, RemoteEndpoint);
-
-			// Look for actual DHT queries that contain InfoHashes
-			await ProcessDhtQueriesForInfoHashes(Message, RemoteEndpoint);
-
-			// Extract InfoHashes from get_peers queries and announce_peer messages
 			await ExtractInfoHashesFromDhtMessage(Message, RemoteEndpoint);
-
-			// Extract and store new node addresses for future crawling
 			await ExtractNodesFromDhtMessage(Message, RemoteEndpoint);
 		}
 		catch (Exception Ex)
@@ -465,50 +481,139 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 		}
 	}
 
-	private async Task ExtractAndStoreNodesFromMessage(string Message, IPEndPoint RemoteEndpoint)
+	private async Task ExtractCompactNodesFromBinaryData(byte[] MessageData, IPEndPoint RemoteEndpoint)
 	{
 		try
 		{
-			// Parse compact node format from nodes responses
+			// Look for "5:nodes" in the binary data and parse the compact node format
+			var Message = Encoding.Latin1.GetString(MessageData);
 			int NodesIndex = Message.IndexOf("5:nodes");
+			
 			if (NodesIndex >= 0)
 			{
-				// Add this responding node to our discovered list
+				// Add the responding node itself
 				if (!DiscoveredNodes.Any(n => n.Address.Equals(RemoteEndpoint.Address) && n.Port == RemoteEndpoint.Port))
 				{
 					DiscoveredNodes.Add(RemoteEndpoint);
+					NodesExtracted++;
+					
+					// Store in database immediately
+					NodeRecord ResponderNode = new(RemoteEndpoint.Address.ToString(), RemoteEndpoint.Port, DateTimeOffset.UtcNow);
+					await Repository.UpsertNodeAsync(ResponderNode);
+					
 					Logger.LogInformation("📍 Added new discovered node: {Endpoint} (Total: {Count})", 
 						RemoteEndpoint, DiscoveredNodes.Count);
 				}
 
-				// Try to parse the compact node format (each node is 26 bytes: 20 byte ID + 4 byte IP + 2 byte port)
-				// This is a simplified parser - real implementation would need proper bencode parsing
-				Logger.LogDebug("📍 Parsing nodes list from {RemoteEndpoint}", RemoteEndpoint);
+				// Try to parse compact nodes (each node is 26 bytes: 20 byte ID + 4 byte IP + 2 byte port)
+				// Find the length after "5:nodes"
+				int NodesStartIndex = NodesIndex + "5:nodes".Length;
+				if (NodesStartIndex < Message.Length)
+				{
+					// Try to extract the nodes length (simplified parsing)
+					int LengthEndIndex = Message.IndexOf(':', NodesStartIndex);
+					if (LengthEndIndex > NodesStartIndex && LengthEndIndex < NodesStartIndex + 10)
+					{
+						if (int.TryParse(Message.Substring(NodesStartIndex, LengthEndIndex - NodesStartIndex), out int NodesLength))
+						{
+							int NodesDataStart = LengthEndIndex + 1;
+							if (NodesDataStart + NodesLength <= MessageData.Length)
+							{
+								// Parse compact nodes (26 bytes each: 20-byte ID + 4-byte IP + 2-byte port)
+								for (int i = 0; i < NodesLength; i += 26)
+								{
+									if (i + 26 <= NodesLength)
+									{
+										try
+										{
+											// Skip node ID (20 bytes), extract IP (4 bytes) and port (2 bytes)
+											int IpStart = NodesDataStart + i + 20;
+											int PortStart = IpStart + 4;
+											
+											if (PortStart + 2 <= MessageData.Length)
+											{
+												var IpBytes = MessageData.AsSpan(IpStart, 4);
+												var PortBytes = MessageData.AsSpan(PortStart, 2);
+												
+												IPAddress NodeIp = new(IpBytes);
+												int NodePort = (PortBytes[0] << 8) | PortBytes[1];
+												
+												IPEndPoint NodeEndpoint = new(NodeIp, NodePort);
+												
+												if (!DiscoveredNodes.Any(n => n.Address.Equals(NodeIp) && n.Port == NodePort))
+												{
+													DiscoveredNodes.Add(NodeEndpoint);
+													NodesExtracted++;
+													
+													// Store in database
+													NodeRecord ExtractedNode = new(NodeIp.ToString(), NodePort, DateTimeOffset.UtcNow);
+													await Repository.UpsertNodeAsync(ExtractedNode);
+								
+													Logger.LogDebug("📍 Extracted compact node: {Endpoint}", NodeEndpoint);
+												}
+											}
+										}
+										catch (Exception Ex)
+										{
+											Logger.LogDebug("Error parsing compact node: {Error}", Ex.Message);
+										}
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 		catch (Exception Ex)
 		{
-			Logger.LogDebug("Error extracting nodes: {Error}", Ex.Message);
+			Logger.LogDebug("Error extracting compact nodes: {Error}", Ex.Message);
 		}
 	}
 
-	private async Task ProcessDhtQueriesForInfoHashes(string Message, IPEndPoint RemoteEndpoint)
+	private async Task ExtractInfoHashesFromBinaryData(byte[] MessageData, IPEndPoint RemoteEndpoint)
 	{
 		try
 		{
-			// Look for incoming DHT queries that might contain InfoHashes
-			if (Message.Contains("1:q") && (Message.Contains("get_peers") || Message.Contains("announce_peer")))
+			// Look for "info_hash" field in bencode format
+			var Message = Encoding.Latin1.GetString(MessageData);
+			
+			// Check for incoming queries (not just our own queries echoed back)
+			bool IsIncomingQuery = Message.Contains("1:q") && (Message.Contains("get_peers") || Message.Contains("announce_peer"));
+			
+			if (IsIncomingQuery)
 			{
-				Logger.LogInformation("🎯 Received incoming DHT query from {RemoteEndpoint}: {MessageType}", 
+				Logger.LogInformation("🎯 INCOMING DHT query from {RemoteEndpoint}: {Type}", 
 					RemoteEndpoint, Message.Contains("get_peers") ? "get_peers" : "announce_peer");
-				
-				// This is where real InfoHashes would be found
-				await ExtractInfoHashesFromDhtMessage(Message, RemoteEndpoint);
+			}
+			
+			int InfoHashIndex = Message.IndexOf("9:info_hash20:");
+			if (InfoHashIndex >= 0)
+			{
+				int HashStart = InfoHashIndex + "9:info_hash20:".Length;
+				if (HashStart + 20 <= MessageData.Length)
+				{
+					// Extract the 20-byte InfoHash directly from binary data
+					byte[] InfoHashBytes = new byte[20];
+					Array.Copy(MessageData, HashStart, InfoHashBytes, 0, 20);
+					
+					// Store the discovered InfoHash
+					InfoHashRecord Record = new(InfoHashBytes, DateTimeOffset.UtcNow);
+					await Repository.UpsertInfoHashAsync(Record);
+					InfoHashesFound++;
+
+					string InfoHashHex = Convert.ToHexString(InfoHashBytes).ToLowerInvariant();
+					Logger.LogInformation("🎯 EXTRACTED InfoHash: {InfoHash} from {RemoteEndpoint} (IsIncoming: {IsIncoming})", 
+						InfoHashHex, RemoteEndpoint, IsIncomingQuery);
+					
+					// Also log to console for immediate visibility
+					Console.WriteLine($"*** INFOHASH FOUND: {InfoHashHex} from {RemoteEndpoint} ***");
+				}
 			}
 		}
 		catch (Exception Ex)
 		{
-			Logger.LogDebug("Error processing DHT queries: {Error}", Ex.Message);
+			Logger.LogDebug("Error extracting InfoHashes from binary data: {Error}", Ex.Message);
 		}
 	}
 
@@ -516,7 +621,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	{
 		try
 		{
-			// Look for info_hash fields in DHT messages
+			// Look for info_hash fields in DHT messages (fallback method)
 			int InfoHashIndex = Message.IndexOf("9:info_hash20:");
 			if (InfoHashIndex >= 0)
 			{
@@ -528,13 +633,13 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					// Store the discovered InfoHash
 					InfoHashRecord Record = new(InfoHashBytes, DateTimeOffset.UtcNow);
 					await Repository.UpsertInfoHashAsync(Record);
+					InfoHashesFound++;
 
 					string InfoHashHex = Convert.ToHexString(InfoHashBytes).ToLowerInvariant();
-					Logger.LogInformation("🎯 EXTRACTED InfoHash: {InfoHash} from {RemoteEndpoint}", 
+					Logger.LogInformation("🎯 EXTRACTED InfoHash (string): {InfoHash} from {RemoteEndpoint}", 
 						InfoHashHex, RemoteEndpoint);
 					
-					// Also log to console for immediate visibility
-					Console.WriteLine($"*** INFOHASH FOUND: {InfoHashHex} ***");
+					Console.WriteLine($"*** INFOHASH FOUND (STRING): {InfoHashHex} ***");
 				}
 			}
 
@@ -552,6 +657,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 						
 						InfoHashRecord Record = new(InfoHashBytes, DateTimeOffset.UtcNow);
 						await Repository.UpsertInfoHashAsync(Record);
+						InfoHashesFound++;
 
 						string InfoHashHex = Convert.ToHexString(InfoHashBytes).ToLowerInvariant();
 						Logger.LogInformation("🎯 CAPTURED InfoHash from announce_peer: {InfoHash} from {RemoteEndpoint}", 
@@ -662,6 +768,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			byte[] InfoHashBytes = PeersEventArgs.InfoHash.Span.ToArray();
 			InfoHashRecord Record = new(InfoHashBytes, DateTimeOffset.UtcNow);
 			await Repository.UpsertInfoHashAsync(Record);
+			InfoHashesFound++;
 
 			string InfoHashHex = BitConverter.ToString(InfoHashBytes).Replace("-", "").ToLowerInvariant();
 			Logger.LogInformation("🎯 DISCOVERED InfoHash via MonoTorrent: {InfoHash} with {PeerCount} peers",
