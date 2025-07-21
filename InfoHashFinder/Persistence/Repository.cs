@@ -81,4 +81,30 @@ public sealed class Repository(string? ConnectionString = null)
 		await using SqliteConnection Connection = await CreateConnectionAsync();
 		return await Connection.QueryAsync<NodeRecord>(Sql);
 	}
+
+	public async Task<int> GetInfoHashCountAsync()
+	{
+		const string Sql = "SELECT COUNT(*) FROM InfoHashes;";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		return await Connection.QuerySingleAsync<int>(Sql);
+	}
+
+	public async Task<int> GetNodeCountAsync()
+	{
+		const string Sql = "SELECT COUNT(*) FROM Nodes;";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		return await Connection.QuerySingleAsync<int>(Sql);
+	}
+
+	public async Task<IEnumerable<InfoHashRecord>> GetRecentInfoHashesAsync(int Limit = 10)
+	{
+		const string Sql = """
+			SELECT InfoHash, FirstSeen 
+			FROM InfoHashes 
+			ORDER BY FirstSeen DESC 
+			LIMIT @Limit;
+			""";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		return await Connection.QueryAsync<InfoHashRecord>(Sql, new { Limit });
+	}
 }
