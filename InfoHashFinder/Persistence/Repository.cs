@@ -25,6 +25,13 @@ public sealed class Repository(string? ConnectionString = null)
 			LastSeen TEXT NOT NULL,
 			PRIMARY KEY(Address, Port)
 		);
+
+		CREATE TABLE IF NOT EXISTS DhtMessageStats
+		(
+			MessageType TEXT PRIMARY KEY,
+			Count INTEGER NOT NULL DEFAULT 0,
+			LastSeen TEXT NOT NULL
+		);
 		""";
 
 	private readonly string ConnectionStringValue = ConnectionString ?? DefaultConnection;
@@ -75,6 +82,28 @@ public sealed class Repository(string? ConnectionString = null)
 		await Connection.ExecuteAsync(Sql, Node);
 	}
 
+	public async Task IncrementMessageTypeAsync(string MessageType)
+	{
+		const string Sql =
+			"""
+			INSERT INTO DhtMessageStats(MessageType, Count, LastSeen)
+			VALUES(@MessageType, 1, @LastSeen)
+			ON CONFLICT(MessageType)
+			DO UPDATE SET Count = Count + 1, LastSeen = excluded.LastSeen;
+			""";
+
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		await Connection.ExecuteAsync(Sql, new { MessageType, LastSeen = DateTimeOffset.UtcNow.ToString("O") });
+	}
+
+	public async Task<IEnumerable<(string MessageType, int Count, DateTimeOffset LastSeen)>> GetMessageStatsAsync()
+	{
+		const string Sql = "SELECT MessageType, Count, LastSeen FROM DhtMessageStats ORDER BY Count DESC;";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		var Results = await Connection.QueryAsync<(string MessageType, int Count, string LastSeen)>(Sql);
+		return Results.Select(r => (r.MessageType, r.Count, DateTimeOffset.Parse(r.LastSeen)));
+	}
+
 	public async Task<IEnumerable<NodeRecord>> LoadNodesAsync()
 	{
 		const string Sql = "SELECT Address, Port, LastSeen FROM Nodes;";
@@ -96,6 +125,17 @@ public sealed class Repository(string? ConnectionString = null)
 		return await Connection.QuerySingleAsync<int>(Sql);
 	}
 
+	public async Task<int> GetActiveNodesInLastHourAsync()
+	{
+		const string Sql = """
+			SELECT COUNT(*) 
+			FROM Nodes 
+			WHERE LastSeen >= datetime('now', '-1 hour');
+			""";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		return await Connection.QuerySingleAsync<int>(Sql);
+	}
+
 	public async Task<IEnumerable<InfoHashRecord>> GetRecentInfoHashesAsync(int Limit = 10)
 	{
 		const string Sql = """
@@ -106,6 +146,41 @@ public sealed class Repository(string? ConnectionString = null)
 			""";
 		await using SqliteConnection Connection = await CreateConnectionAsync();
 		return await Connection.QueryAsync<InfoHashRecord>(Sql, new { Limit });
+	}
+
+	public async Task<int> GetInfoHashesInLastHourAsync()
+	{
+		const string Sql = """
+			SELECT COUNT(*) 
+			FROM InfoHashes 
+			WHERE FirstSeen >= datetime('now', '-1 hour');
+			""";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		return await Connection.QuerySingleAsync<int>(Sql);
+	}
+
+	public async Task<int> GetInfoHashesInLastDayAsync()
+	{
+		const string Sql = """
+			SELECT COUNT(*) 
+			FROM InfoHashes 
+			WHERE FirstSeen >= datetime('now', '-1 day');
+			""";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		return await Connection.QuerySingleAsync<int>(Sql);
+	}
+
+	public async Task<(int UniqueIPs, double AvgPort)> GetNodeDiversityStatsAsync()
+	{
+		const string Sql = """
+			SELECT 
+				COUNT(DISTINCT Address) as UniqueIPs,
+				AVG(CAST(Port as REAL)) as AvgPort
+			FROM Nodes;
+			""";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		var Result = await Connection.QuerySingleAsync<(int UniqueIPs, double AvgPort)>(Sql);
+		return Result;
 	}
 
 	public async Task ForceCommitAsync()
