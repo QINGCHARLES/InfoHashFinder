@@ -107,4 +107,12 @@ public sealed class Repository(string? ConnectionString = null)
 		await using SqliteConnection Connection = await CreateConnectionAsync();
 		return await Connection.QueryAsync<InfoHashRecord>(Sql, new { Limit });
 	}
+
+	public async Task ForceCommitAsync()
+	{
+		// Force WAL checkpoint to commit data to main database file
+		const string Sql = "PRAGMA wal_checkpoint(FULL);";
+		await using SqliteConnection Connection = await CreateConnectionAsync();
+		await Connection.ExecuteAsync(Sql);
+	}
 }
