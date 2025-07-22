@@ -63,7 +63,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					if (DhtEngineField.State == DhtState.Ready || DhtEngineField.State == DhtState.Initialising)
 					{
 						// Send strategic get_peers queries to stimulate the network
-						SendStrategicQueries(round);
+						await SendStrategicQueries(round);
 						consecutiveErrors = 0; // Reset error counter on success
 					}
 					else
@@ -79,7 +79,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					}
 
 					// Log engine state every 5 minutes if not ready
-					if (round % 300 == 0 && DhtEngineField.State != DhtState.Ready)
+					if (round % 300 == 0 && DhtEngineField != null && DhtEngineField.State != DhtState.Ready)
 					{
 						Logger.LogWarning("DHT engine has been in {State} state for {Minutes} minutes", 
 							DhtEngineField.State, round / 60);
@@ -222,16 +222,16 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 		}
 
 		// Add all node IDs at once
-		if (allNodeIds.Count > 0)
+		if (allNodeIds.Count > 0 && DhtEngineField != null)
 		{
 			DhtEngineField.Add(allNodeIds);
 			Logger.LogInformation("✅ Added {Count} total node IDs (bootstrap + persisted)", allNodeIds.Count);
 		}
 	}
 
-	private Task SendStrategicQueries(int Round)
+	private async Task SendStrategicQueries(int Round)
 	{
-		if (DhtEngineField == null) return Task.CompletedTask;
+		if (DhtEngineField == null) return;
 
 		try
 		{
@@ -259,12 +259,12 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			DhtEngineField.GetPeers(targetInfoHash);
 			QueriesSent++;
 
-			return Task.CompletedTask;
+			// Add a small delay to prevent overwhelming the network
+			await Task.Delay(10);
 		}
 		catch (Exception Ex)
 		{
 			Logger.LogDebug("Error sending DHT query: {Error}", Ex.Message);
-			return Task.CompletedTask;
 		}
 	}
 
@@ -323,7 +323,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	}
 
 	// This is the CORRECT and ONLY way to receive InfoHashes
-	private async void OnPeersFound(object? Sender, PeersFoundEventArgs? EventArgs)
+	private async void OnPeersFound(object? Sender, PeersFoundEventArgs EventArgs)
 	{
 		if (EventArgs == null) return;
 
