@@ -59,8 +59,10 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					await timer.WaitForNextTickAsync(ServiceCancellationToken);
 					round++;
 
-					// Check DHT engine state - allow queries in more states
-					if (DhtEngineField.State == DhtState.Ready || DhtEngineField.State == DhtState.Initialising)
+					// Check DHT engine state - be more aggressive about allowing queries
+					if (DhtEngineField.State == DhtState.Ready || 
+					    DhtEngineField.State == DhtState.Initialising ||
+					    DhtEngineField.State == DhtState.NotReady) // Allow queries even in NotReady state
 					{
 						// Send strategic get_peers queries to stimulate the network
 						await SendStrategicQueries(round);
@@ -237,22 +239,25 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 		{
 			InfoHash targetInfoHash;
 
-			// Strategy: Mix of random hashes and previously discovered ones
-			if (KnownInfoHashes.Count > 0 && Round % 3 == 0)
+			// Strategy: Mix of random hashes and previously discovered ones with thread safety
+			lock (KnownInfoHashes)
 			{
-				// 1/3 of the time: requery known InfoHashes (higher success rate)
-				targetInfoHash = KnownInfoHashes[Random.Shared.Next(KnownInfoHashes.Count)];
-				Logger.LogDebug("🔄 Requerying known InfoHash: {Hash}...", 
-					targetInfoHash.ToString()[..8]);
-			}
-			else
-			{
-				// 2/3 of the time: try random InfoHashes (discovery)
-				byte[] randomBytes = new byte[20];
-				Random.Shared.NextBytes(randomBytes);
-				targetInfoHash = new InfoHash(randomBytes);
-				Logger.LogDebug("🎲 Querying random InfoHash: {Hash}...", 
-					targetInfoHash.ToString()[..8]);
+				if (KnownInfoHashes.Count > 0 && Round % 3 == 0)
+				{
+					// 1/3 of the time: requery known InfoHashes (higher success rate)
+					targetInfoHash = KnownInfoHashes[Random.Shared.Next(KnownInfoHashes.Count)];
+					Logger.LogDebug("🔄 Requerying known InfoHash: {Hash}... (Pool: {PoolSize})", 
+						targetInfoHash.ToString()[..8], KnownInfoHashes.Count);
+				}
+				else
+				{
+					// 2/3 of the time: try random InfoHashes (discovery)
+					byte[] randomBytes = new byte[20];
+					Random.Shared.NextBytes(randomBytes);
+					targetInfoHash = new InfoHash(randomBytes);
+					Logger.LogDebug("🎲 Querying random InfoHash: {Hash}... (Pool: {PoolSize})", 
+						targetInfoHash.ToString()[..8], KnownInfoHashes.Count);
+				}
 			}
 
 			// Use MonoTorrent's CORRECT API - it handles all protocol details
@@ -335,21 +340,24 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			var Record = new InfoHashRecord(InfoHashBytes, DateTimeOffset.UtcNow);
 			await Repository.UpsertInfoHashAsync(Record);
 
-			// Add to known InfoHashes pool for strategic requerying
-			if (!KnownInfoHashes.Contains(EventArgs.InfoHash))
+			// Add to known InfoHashes pool for strategic requerying - FIXED synchronization
+			lock (KnownInfoHashes)
 			{
-				KnownInfoHashes.Add(EventArgs.InfoHash);
-				
-				// Limit pool size to prevent memory growth
-				if (KnownInfoHashes.Count > 1000)
+				if (!KnownInfoHashes.Contains(EventArgs.InfoHash))
 				{
-					KnownInfoHashes.RemoveAt(0);
+					KnownInfoHashes.Add(EventArgs.InfoHash);
+					
+					// Limit pool size to prevent memory growth
+					if (KnownInfoHashes.Count > 1000)
+					{
+						KnownInfoHashes.RemoveAt(0);
+					}
 				}
 			}
 
 			string InfoHashHex = EventArgs.InfoHash.ToString();
-			Logger.LogInformation("🎯 INFOHASH FOUND ({Total}): {InfoHash} with {PeerCount} peers", 
-				InfoHashesFound, InfoHashHex, EventArgs.Peers.Count);
+			Logger.LogInformation("🎯 INFOHASH FOUND ({Total}): {InfoHash} with {PeerCount} peers | Pool: {PoolSize}", 
+				InfoHashesFound, InfoHashHex, EventArgs.Peers.Count, KnownInfoHashes.Count);
 			
 			Console.WriteLine($"*** INFOHASH DISCOVERED: {InfoHashHex} with {EventArgs.Peers.Count} peers ***");
 
