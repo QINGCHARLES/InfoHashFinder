@@ -45,6 +45,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			// 4. Core scraping loop: send frequent get_peers queries
 			using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1)); // Query every second
 			int round = 0;
+			int consecutiveErrors = 0;
 
 			while (!ServiceCancellationToken.IsCancellationRequested)
 			{
@@ -53,18 +54,48 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					await timer.WaitForNextTickAsync(ServiceCancellationToken);
 					round++;
 
-					// Send strategic get_peers queries to stimulate the network
-					await SendStrategicQueries(round);
+					// Check DHT engine state before sending queries
+					if (DhtEngineField.State == DhtState.Ready)
+					{
+						// Send strategic get_peers queries to stimulate the network
+						SendStrategicQueries(round);
+						consecutiveErrors = 0; // Reset error counter on success
+					}
+					else
+					{
+						Logger.LogDebug("DHT engine not ready (State: {State}), skipping query round {Round}", 
+							DhtEngineField.State, round);
+					}
 
 					// Log statistics every minute
 					if (round % 60 == 0)
 					{
 						await LogStatisticsAsync(round / 60);
 					}
+
+					// Log engine state every 5 minutes if not ready
+					if (round % 300 == 0 && DhtEngineField.State != DhtState.Ready)
+					{
+						Logger.LogWarning("DHT engine has been in {State} state for {Minutes} minutes", 
+							DhtEngineField.State, round / 60);
+					}
 				}
 				catch (OperationCanceledException)
 				{
 					break;
+				}
+				catch (Exception Ex)
+				{
+					consecutiveErrors++;
+					Logger.LogWarning(Ex, "Error in DHT query loop (consecutive errors: {ErrorCount})", consecutiveErrors);
+					
+					// If too many consecutive errors, add a longer delay
+					if (consecutiveErrors > 10)
+					{
+						Logger.LogWarning("Too many consecutive errors, pausing for 30 seconds...");
+						await Task.Delay(TimeSpan.FromSeconds(30), ServiceCancellationToken);
+						consecutiveErrors = 0;
+					}
 				}
 			}
 		}
@@ -88,42 +119,45 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 
 	private async Task AddBootstrapNodesAsync()
 	{
-		// Add bootstrap hostnames using available MonoTorrent API
+		if (DhtEngineField == null)
+		{
+			Logger.LogWarning("DhtEngine is null, cannot add bootstrap nodes");
+			return;
+		}
+
+		// Add bootstrap hostnames using available MonoTorrent API  
+		var allNodeIds = new List<ReadOnlyMemory<byte>>();
+		
 		foreach ((string hostname, int port) in BootstrapHostnames)
 		{
 			try
 			{
-				// Resolve hostname to IP and add to the engine
+				// Resolve hostname to IP and create node ID
 				IPAddress[] addresses = await Dns.GetHostAddressesAsync(hostname);
 				foreach (IPAddress address in addresses)
 				{
 					if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
 					{
-						// Use the Add method with ReadOnlyMemory<byte> for node IDs
 						// Create a deterministic node ID from the endpoint
 						using var hasher = System.Security.Cryptography.SHA1.Create();
 						byte[] endpointData = System.Text.Encoding.UTF8.GetBytes($"{address}:{port}");
 						byte[] nodeId = hasher.ComputeHash(endpointData);
+						allNodeIds.Add(nodeId);
 						
-						List<ReadOnlyMemory<byte>> nodeIds = new() { nodeId };
-						DhtEngineField!.Add(nodeIds);
-						
-						Logger.LogInformation("✅ Added bootstrap node: {Hostname} -> {Address}:{Port}", hostname, address, port);
+						Logger.LogInformation("✅ Prepared bootstrap node: {Hostname} -> {Address}:{Port}", hostname, address, port);
 						break; // Use first IPv4 address
 					}
 				}
 			}
 			catch (Exception Ex)
 			{
-				Logger.LogWarning(Ex, "Failed to add bootstrap node {Hostname}:{Port}", hostname, port);
+				Logger.LogWarning(Ex, "Failed to resolve bootstrap node {Hostname}:{Port}", hostname, port);
 			}
 		}
 
-		// Also add some persisted nodes as node IDs
+		// Add persisted nodes from database
 		var persistedNodes = await Repository.LoadNodesAsync();
-		var nodeIdList = new List<ReadOnlyMemory<byte>>();
-		
-		foreach (var node in persistedNodes.Take(20))
+		foreach (var node in persistedNodes.Take(50)) // Add more for better network reach
 		{
 			try
 			{
@@ -133,7 +167,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					using var hasher = System.Security.Cryptography.SHA1.Create();
 					byte[] endpointData = System.Text.Encoding.UTF8.GetBytes($"{ip}:{node.Port}");
 					byte[] nodeId = hasher.ComputeHash(endpointData);
-					nodeIdList.Add(nodeId);
+					allNodeIds.Add(nodeId);
 					
 					Logger.LogDebug("Prepared persisted node ID for: {Address}:{Port}", node.Address, node.Port);
 				}
@@ -145,16 +179,17 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			}
 		}
 
-		if (nodeIdList.Count > 0)
+		// Add all node IDs at once
+		if (allNodeIds.Count > 0)
 		{
-			DhtEngineField!.Add(nodeIdList);
-			Logger.LogInformation("✅ Added {Count} persisted node IDs", nodeIdList.Count);
+			DhtEngineField.Add(allNodeIds);
+			Logger.LogInformation("✅ Added {Count} total node IDs (bootstrap + persisted)", allNodeIds.Count);
 		}
 	}
 
-	private async Task SendStrategicQueries(int Round)
+	private Task SendStrategicQueries(int Round)
 	{
-		if (DhtEngineField == null) return;
+		if (DhtEngineField == null) return Task.CompletedTask;
 
 		try
 		{
@@ -182,10 +217,12 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			DhtEngineField.GetPeers(targetInfoHash);
 			QueriesSent++;
 
+			return Task.CompletedTask;
 		}
 		catch (Exception Ex)
 		{
 			Logger.LogDebug("Error sending DHT query: {Error}", Ex.Message);
+			return Task.CompletedTask;
 		}
 	}
 
@@ -201,8 +238,9 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 				QueriesSent > 0 ? (double)InfoHashesFound / QueriesSent : 0, 
 				KnownInfoHashes.Count);
 
-			Logger.LogInformation("📊 Engine Stats - DHT State: {State} | Nodes in routing table: {NodeCount}", 
-				DhtEngineField?.State ?? DhtState.NotReady, NodeCount);
+			Logger.LogInformation("📊 Engine Stats - DHT State: {State} | Nodes in routing table: {NodeCount} | Discovery rate: {Rate:F1}/hour", 
+				DhtEngineField?.State ?? DhtState.NotReady, NodeCount, 
+				Minutes > 0 ? (double)InfoHashCount / (Minutes / 60.0) : 0);
 
 			// Log recent discoveries
 			if (InfoHashCount > 0)
@@ -212,9 +250,15 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					string.Join(", ", recentHashes.Select(h => Convert.ToHexString(h.InfoHash).ToLowerInvariant()[..8] + "...")));
 			}
 
-			// Calculate discovery rate
-			double InfoHashesPerHour = Minutes > 0 ? (double)InfoHashCount / (Minutes / 60.0) : 0;
-			Logger.LogInformation("📈 Discovery Rate: {Rate:F1} InfoHashes/hour", InfoHashesPerHour);
+			// Show progress towards building a good InfoHash pool
+			if (KnownInfoHashes.Count < 50)
+			{
+				Logger.LogInformation("🎯 Building InfoHash pool: {KnownCount}/50 for strategic requerying", KnownInfoHashes.Count);
+			}
+			else if (Minutes % 10 == 0) // Log pool status every 10 minutes once established
+			{
+				Logger.LogInformation("🎯 InfoHash pool: {KnownCount} hashes available for strategic requerying", KnownInfoHashes.Count);
+			}
 
 			// Force database commit
 			if (Minutes % 5 == 0)
@@ -230,8 +274,10 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	}
 
 	// This is the CORRECT and ONLY way to receive InfoHashes
-	private async void OnPeersFound(object? Sender, PeersFoundEventArgs EventArgs)
+	private async void OnPeersFound(object? Sender, PeersFoundEventArgs? EventArgs)
 	{
+		if (EventArgs == null) return;
+
 		try
 		{
 			InfoHashesFound++;
@@ -263,10 +309,16 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			{
 				try
 				{
-					// PeerInfo likely has different property names - check what's available
-					// Common properties might be: Address, Port, IP, etc.
-					// For now, skip peer storage since the API is unclear
-					Logger.LogDebug("Found peer (storage skipped due to API uncertainty)");
+					// Extract peer information using ConnectionUri
+					if (peer.ConnectionUri != null)
+					{
+						IPAddress peerIp = IPAddress.Parse(peer.ConnectionUri.Host);
+						int peerPort = peer.ConnectionUri.Port;
+
+						var peerNodeRecord = new NodeRecord(peerIp.ToString(), peerPort, DateTimeOffset.UtcNow);
+						await Repository.UpsertNodeAsync(peerNodeRecord);
+						Logger.LogDebug("Discovered and stored potential node from peer: {IP}:{Port}", peerIp, peerPort);
+					}
 				}
 				catch (Exception Ex)
 				{
