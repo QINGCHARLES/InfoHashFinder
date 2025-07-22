@@ -12,6 +12,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 	private int InfoHashesFound = 0;
 	private int QueriesSent = 0;
 	private readonly List<InfoHash> KnownInfoHashes = new();
+	private const string NodeIdFilePath = "dht_node_id.dat";
 
 	private readonly List<(string Hostname, int Port)> BootstrapHostnames = new()
 	{
@@ -27,22 +28,26 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 
 		try
 		{
-			Logger.LogInformation("🚀 Starting CORRECT DHT crawler using MonoTorrent only...");
+			Logger.LogInformation("🚀 Starting ENHANCED DHT crawler using MonoTorrent with persistent node ID...");
 
-			// 1. Create the DhtEngine - it handles ALL networking internally
+			// 1. Get or create persistent node ID
+			byte[] persistentNodeId = await GetOrCreatePersistentNodeIdAsync();
+
+			// 2. Create the DhtEngine - it handles ALL networking internally
 			DhtEngineField = new DhtEngine();
 			DhtEngineField.PeersFound += OnPeersFound;
 
-			// 2. Start the engine - MonoTorrent manages the UDP socket
-			await DhtEngineField.StartAsync();
-			Logger.LogInformation("✅ DHT engine started successfully");
+			// 3. Start the engine with persistent node ID - MonoTorrent manages the UDP socket
+			await DhtEngineField.StartAsync(persistentNodeId);
+			Logger.LogInformation("✅ DHT engine started successfully with persistent node ID: {NodeId}", 
+				Convert.ToHexString(persistentNodeId).ToLowerInvariant());
 
-			// 3. Add bootstrap nodes using CORRECT API
+			// 4. Add bootstrap nodes using CORRECT API
 			await AddBootstrapNodesAsync();
 
 			Logger.LogInformation("🔥 Starting DHT scraping loop - sending get_peers queries...");
 
-			// 4. Core scraping loop: send frequent get_peers queries
+			// 5. Core scraping loop: send frequent get_peers queries
 			using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1)); // Query every second
 			int round = 0;
 			int consecutiveErrors = 0;
@@ -54,8 +59,8 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 					await timer.WaitForNextTickAsync(ServiceCancellationToken);
 					round++;
 
-					// Check DHT engine state before sending queries
-					if (DhtEngineField.State == DhtState.Ready)
+					// Check DHT engine state - allow queries in more states
+					if (DhtEngineField.State == DhtState.Ready || DhtEngineField.State == DhtState.Initialising)
 					{
 						// Send strategic get_peers queries to stimulate the network
 						SendStrategicQueries(round);
@@ -114,6 +119,43 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 				DhtEngineField.PeersFound -= OnPeersFound;
 				await DhtEngineField.StopAsync();
 			}
+		}
+	}
+
+	private async Task<byte[]> GetOrCreatePersistentNodeIdAsync()
+	{
+		try
+		{
+			// Try to load existing node ID from file
+			if (File.Exists(NodeIdFilePath))
+			{
+				byte[] existingNodeId = await File.ReadAllBytesAsync(NodeIdFilePath);
+				if (existingNodeId.Length == 20)
+				{
+					Logger.LogInformation("✅ Loaded existing persistent node ID from {FilePath}", NodeIdFilePath);
+					return existingNodeId;
+				}
+				else
+				{
+					Logger.LogWarning("⚠️ Invalid node ID file (wrong length), creating new one");
+				}
+			}
+
+			// Create new persistent node ID
+			byte[] newNodeId = new byte[20];
+			Random.Shared.NextBytes(newNodeId);
+			
+			await File.WriteAllBytesAsync(NodeIdFilePath, newNodeId);
+			Logger.LogInformation("✅ Created new persistent node ID and saved to {FilePath}", NodeIdFilePath);
+			
+			return newNodeId;
+		}
+		catch (Exception Ex)
+		{
+			Logger.LogWarning(Ex, "Failed to load/save persistent node ID, using random ID for this session");
+			byte[] fallbackNodeId = new byte[20];
+			Random.Shared.NextBytes(fallbackNodeId);
+			return fallbackNodeId;
 		}
 	}
 
@@ -242,6 +284,13 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 				DhtEngineField?.State ?? DhtState.NotReady, NodeCount, 
 				Minutes > 0 ? (double)InfoHashCount / (Minutes / 60.0) : 0);
 
+			// Add diagnostic information about the DHT state issue
+			if (DhtEngineField?.State != DhtState.Ready && Minutes > 5)
+			{
+				Logger.LogInformation("🔧 DHT Diagnostic - State: {State} | InfoHashes discovered: {Count} | This indicates passive discovery is working even without Ready state", 
+					DhtEngineField?.State, InfoHashCount);
+			}
+
 			// Log recent discoveries
 			if (InfoHashCount > 0)
 			{
@@ -304,6 +353,10 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 			
 			Console.WriteLine($"*** INFOHASH DISCOVERED: {InfoHashHex} with {EventArgs.Peers.Count} peers ***");
 
+			// Log successful passive discovery to confirm it's working
+			Logger.LogDebug("✅ Passive discovery working - DHT State: {State}, Total discovered: {Total}", 
+				(Sender as DhtEngine)?.State ?? DhtState.NotReady, InfoHashesFound);
+
 			// Store discovered peers as potential nodes
 			foreach (var peer in EventArgs.Peers.Take(10)) // Limit to avoid spam
 			{
@@ -334,7 +387,7 @@ public sealed class DhtCrawlerService(Repository Repository, ILogger<DhtCrawlerS
 
 	public override async Task StopAsync(CancellationToken CancellationToken)
 	{
-		Logger.LogInformation("Stopping DHT crawler service...");
+		Logger.LogInformation("Stopping enhanced DHT crawler service...");
 		await base.StopAsync(CancellationToken);
 	}
 }
